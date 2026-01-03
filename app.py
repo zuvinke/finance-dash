@@ -213,7 +213,12 @@ REVENUE_TAG_CANDIDATES = [
     ("us-gaap", "Revenues"),
     ("us-gaap", "SalesRevenueNet"),
     ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax"),
+    ("us-gaap", "RevenueFromContractWithCustomerIncludingAssessedTax"),
+    ("us-gaap", "SalesRevenueServicesNet"),
+    ("us-gaap", "SalesRevenueGoodsNet"),
+    ("us-gaap", "TotalRevenuesAndOtherIncome"),
 ]
+
 
 NET_INCOME_CANDIDATES = [
     ("us-gaap", "NetIncomeLoss"),
