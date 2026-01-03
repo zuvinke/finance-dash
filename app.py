@@ -330,10 +330,19 @@ eps_df, eps_meta = load_metric_df("EPS (Diluted)", EPS_DILUTED_CANDIDATES, prefe
 gp_df, gp_meta = load_metric_df("Gross Profit", GROSS_PROFIT_CANDIDATES, preferred_units=("USD",))
 op_df, op_meta = load_metric_df("Operating Income", OPERATING_INCOME_CANDIDATES, preferred_units=("USD",))
 
-# Build quarterly + annual
-rev_q, rev_a = build_quarterly(rev_df), build_annual(rev_df)
-eps_q, eps_a = build_quarterly(eps_df), build_annual(eps_df)
-ni_q, ni_a = build_quarterly(ni_df), build_annual(ni_df)
+
+# Annual as before
+rev_a = build_annual(rev_df)
+eps_a = build_annual(eps_df)
+ni_a  = build_annual(ni_df)
+
+# Quarterly: convert YTD → true quarterly for income-statement style items
+rev_q = ytd_to_quarterly(rev_df)
+ni_q  = ytd_to_quarterly(ni_df)
+
+# EPS is usually already per quarter (not YTD), so keep existing logic
+eps_q = build_quarterly(eps_df)
+
 
 gp_q = build_quarterly(gp_df)
 op_q = build_quarterly(op_df)
