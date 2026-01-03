@@ -293,12 +293,16 @@ eps_df = load_metric_df("EPS (Diluted)", EPS_DILUTED_CANDIDATES, preferred_units
 gp_df  = load_metric_df("Gross Profit", GROSS_PROFIT_CANDIDATES, preferred_units=("USD",))
 op_df  = load_metric_df("Operating Income", OPERATING_INCOME_CANDIDATES, preferred_units=("USD",))
 
-# Quarterly: Revenue prefers true quarterly; fallback to YTD differencing if sparse
-rev_q = build_quarterly(rev_df)
-if len(rev_q) < 8:
-    rev_q = ytd_to_quarterly(rev_df)
+# ----------------------------
+# Quarterly series (KEY FIX)
+# Revenue is often YTD/FY-only in SEC facts, so default to YTD→Quarterly.
+# If that fails, fallback to raw quarterly.
+# ----------------------------
+rev_q = ytd_to_quarterly(rev_df)
+if rev_q.empty:
+    rev_q = build_quarterly(rev_df)
 
-# Income statement items (YTD -> true quarterly tends to be best)
+# Other income statement items: YTD→Quarterly tends to be best
 ni_q  = ytd_to_quarterly(ni_df)
 gp_q  = ytd_to_quarterly(gp_df)
 op_q  = ytd_to_quarterly(op_df)
@@ -306,10 +310,11 @@ op_q  = ytd_to_quarterly(op_df)
 # EPS usually already quarterly
 eps_q = build_quarterly(eps_df)
 
-# Derived series
+# Derived metrics
 if not rev_q.empty:
     rev_q = rev_q.sort_values("end").reset_index(drop=True)
     rev_q["Revenue YoY %"] = yoy_growth(rev_q["val"], periods=4)
+
 if not eps_q.empty:
     eps_q = eps_q.sort_values("end").reset_index(drop=True)
     eps_q["EPS YoY %"] = yoy_growth(eps_q["val"], periods=4)
@@ -337,9 +342,7 @@ if not rev_q.empty:
         margins_q = margins_q.merge(ni_q[["end", "val"]].rename(columns={"val": "net_income"}), on="end", how="left")
         margins_q["Net Margin %"] = (margins_q["net_income"] / margins_q["revenue"]) * 100.0
 
-# ----------------------------
-# KPI cards (independent latest)
-# ----------------------------
+# KPI (independent latest)
 k_rev, d_rev = latest_val(rev_q)
 k_eps, d_eps = latest_val(eps_q)
 k_ni,  d_ni  = latest_val(ni_q)
@@ -477,7 +480,6 @@ with tab3:
         if s_df.empty:
             st.info("No surprise data returned (could be coverage or rate limit).")
         else:
-            # Surprise % as bars
             plot = s_df[["date", "surprisePercent"]].dropna().sort_values("date").rename(
                 columns={"date": "end", "surprisePercent": "value"}
             )
