@@ -418,14 +418,41 @@ with tab1:
     left, right = st.columns(2)
 
     with left:
-        st.subheader("Revenue (Quarterly) + TTM")
+                import altair as alt
+
         if rev_q.empty:
-            st.info("Revenue not found in SEC tags for this ticker (rare). Try another or we’ll add more tag fallbacks.")
+            st.info("Revenue not found yet — we can expand SEC tag fallbacks if needed.")
         else:
-            plot_df = rev_q[["end", "val"]].rename(columns={"val": "Quarterly Revenue"})
-            plot_df = plot_df.merge(rev_ttm[["end", "ttm"]].rename(columns={"ttm": "TTM Revenue"}), on="end", how="left")
-            plot_df = plot_df.set_index("end")
-            st.line_chart(plot_df)
+            plot_df = (
+                rev_q[["end", "val"]]
+                .rename(columns={"val": "Quarterly Revenue"})
+                .merge(
+                    compute_ttm(rev_q, "val")[["end", "ttm"]]
+                    .rename(columns={"ttm": "TTM Revenue"}),
+                    on="end",
+                    how="left",
+                )
+                .dropna(subset=["end"])
+                .sort_values("end")
+            )
+
+            base = alt.Chart(plot_df).encode(
+                x=alt.X("end:T", title="Period End")
+            )
+
+            bars = base.mark_bar().encode(
+                y=alt.Y("Quarterly Revenue:Q", title="Quarterly Revenue")
+            )
+
+            line = base.mark_line(strokeWidth=3).encode(
+                y=alt.Y("TTM Revenue:Q", title="TTM Revenue")
+            )
+
+            st.altair_chart(
+                alt.layer(bars, line).resolve_scale(y="independent"),
+                use_container_width=True,
+            )
+
 
     with right:
         st.subheader("EPS (Diluted) (Quarterly) + TTM (approx)")
