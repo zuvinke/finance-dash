@@ -390,16 +390,32 @@ with tab2:
                 plot_df = margins_q[["end"] + cols].sort_values("end").set_index("end")
                 st.line_chart(plot_df)
 
-    st.subheader("Raw SEC Data (last 12 quarters)")
-    show_df = pd.DataFrame({"end": rev_q["end"]}) if not rev_q.empty else pd.DataFrame()
+st.subheader("Raw SEC Data (last 12 quarters)")
+
+# Build an 'end' index from whatever series is available (revenue, eps, or net income)
+ends = []
+if not rev_q.empty:
+    ends.append(rev_q["end"])
+if not eps_q.empty:
+    ends.append(eps_q["end"])
+if not ni_q.empty:
+    ends.append(ni_q["end"])
+
+if not ends:
+    st.info("No quarterly series available to show raw data.")
+else:
+    show_df = pd.DataFrame({"end": pd.concat(ends).dropna().drop_duplicates().sort_values()})
+
     if not rev_q.empty:
-        show_df["revenue"] = rev_q["val"].values
+        show_df = show_df.merge(rev_q[["end", "val"]].rename(columns={"val": "revenue"}), on="end", how="left")
     if not eps_q.empty:
-        show_df = show_df.merge(eps_q[["end", "val"]].rename(columns={"val": "eps_diluted"}), on="end", how="outer")
+        show_df = show_df.merge(eps_q[["end", "val"]].rename(columns={"val": "eps_diluted"}), on="end", how="left")
     if not ni_q.empty:
-        show_df = show_df.merge(ni_q[["end", "val"]].rename(columns={"val": "net_income"}), on="end", how="outer")
+        show_df = show_df.merge(ni_q[["end", "val"]].rename(columns={"val": "net_income"}), on="end", how="left")
+
     show_df = show_df.sort_values("end", ascending=False).head(12)
     st.dataframe(show_df, use_container_width=True)
+
 
 with tab3:
     st.subheader("Historical Earnings Surprises (EPS Actual vs Estimate)")
