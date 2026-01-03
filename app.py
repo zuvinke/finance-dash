@@ -125,6 +125,79 @@ def build_quarterly(df: pd.DataFrame):
     q = df[df["fp"].isin(["Q1", "Q2", "Q3", "Q4"])].copy()
     return keep_latest_per_period(q)
 
+FP_ORDER = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4, "FY": 5}
+
+def ytd_to_quarterly(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Many SEC income statement items for 10-Qs are reported YTD for Q2/Q3.
+    Convert to single-quarter values by differencing within the same FY.
+    Keeps only Q1-Q4 periods.
+    """
+    if df.empty:
+        return df
+
+    out = []
+    d = df[df["fp"].isin(["Q1", "Q2", "Q3", "Q4", "FY"])].copy()
+    d["fp_order"] = d["fp"].map(FP_ORDER)
+    d = keep_latest_per_period(d).sort_values(["fy", "fp_order", "end"])
+
+    for fy, g in d.groupby("fy", dropna=True):
+        g = g.sort_values("fp_order").copy()
+
+        # Get YTD rows for Q1-Q3 if present
+        q1 = g[g["fp"] == "Q1"].tail(1)
+        q2 = g[g["fp"] == "Q2"].tail(1)
+        q3 = g[g["fp"] == "Q3"].tail(1)
+        q4 = g[g["fp"] == "Q4"].tail(1)
+        fy_row = g[g["fp"] == "FY"].tail(1)
+
+        def val(row):
+            return float(row["val"].iloc[0]) if not row.empty else None
+        def end(row):
+            return row["end"].iloc[0] if not row.empty else None
+
+        v1, v2, v3 = val(q1), val(q2), val(q3)
+
+        # Q1 is usually already single quarter; Q2/Q3 often YTD → difference them
+        if v1 is not None and end(q1) is not None:
+            r = q1.iloc[0].to_dict()
+            r["val"] = v1
+            r["fp"] = "Q1"
+            out.append(r)
+
+        if v2 is not None and end(q2) is not None:
+            r = q2.iloc[0].to_dict()
+            r["val"] = v2 - v1 if (v1 is not None and v2 is not None) else v2
+            r["fp"] = "Q2"
+            out.append(r)
+
+        if v3 is not None and end(q3) is not None:
+            r = q3.iloc[0].to_dict()
+            r["val"] = v3 - v2 if (v2 is not None and v3 is not None) else v3
+            r["fp"] = "Q3"
+            out.append(r)
+
+        # For Q4: if FY exists, Q4 = FY - Q3(YTD). Otherwise keep Q4 if present.
+        if not fy_row.empty and end(fy_row) is not None:
+            vfy = val(fy_row)
+            if vfy is not None:
+                r = fy_row.iloc[0].to_dict()
+                r["val"] = vfy - v3 if (v3 is not None) else vfy
+                r["fp"] = "Q4"
+                # end date should be FY end already
+                out.append(r)
+        elif not q4.empty and end(q4) is not None:
+            out.append(q4.iloc[0].to_dict())
+
+    out_df = pd.DataFrame(out)
+    if out_df.empty:
+        return out_df
+
+    out_df = out_df.drop(columns=[c for c in ["fp_order"] if c in out_df.columns], errors="ignore")
+    out_df = out_df.sort_values("end")
+    return keep_latest_per_period(out_df)
+
+
 def build_annual(df: pd.DataFrame):
     if df.empty:
         return df
