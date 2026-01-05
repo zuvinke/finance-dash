@@ -294,15 +294,22 @@ gp_df  = load_metric_df("Gross Profit", GROSS_PROFIT_CANDIDATES, preferred_units
 op_df  = load_metric_df("Operating Income", OPERATING_INCOME_CANDIDATES, preferred_units=("USD",))
 
 # ----------------------------
-# Quarterly series (KEY FIX)
-# Revenue is often YTD/FY-only in SEC facts, so default to YTD→Quarterly.
-# If that fails, fallback to raw quarterly.
+# Quarterly series (Revenue special handling)
 # ----------------------------
+# Revenue in SEC XBRL can be FY-only for some companies (including AAPL in recent years).
+# Convert YTD -> quarterly, but if we still don't have enough quarters to be meaningful,
+# we hide the revenue chart to avoid misleading visuals.
 rev_q = ytd_to_quarterly(rev_df)
 if rev_q.empty:
     rev_q = build_quarterly(rev_df)
 
-# Other income statement items: YTD→Quarterly tends to be best
+# If still too sparse, treat as unavailable for charting
+if len(rev_q) < 4:
+    rev_q_chart = pd.DataFrame()
+else:
+    rev_q_chart = rev_q
+
+# Other income statement items: YTD->Quarterly is typically best
 ni_q  = ytd_to_quarterly(ni_df)
 gp_q  = ytd_to_quarterly(gp_df)
 op_q  = ytd_to_quarterly(op_df)
@@ -370,13 +377,16 @@ with tab1:
 
     with left:
         st.subheader("Revenue (Quarterly) + TTM")
-        if rev_q.empty:
-            st.info("Revenue not found yet — we can expand SEC tag fallbacks if needed.")
+        if rev_q_chart.empty:
+            st.info(
+                "Quarterly revenue is not consistently available in SEC XBRL for this company.\n\n"
+                "This can happen (including AAPL). EPS and Net Income remain reliable."
+            )
         else:
             plot = (
-                rev_q[["end", "val"]]
+                rev_q_chart[["end", "val"]]
                 .rename(columns={"val": "q"})
-                .merge(rev_ttm[["end", "ttm"]].rename(columns={"ttm": "ttm"}), on="end", how="left")
+                .merge(compute_ttm(rev_q_chart, "val")[["end", "ttm"]], on="end", how="left")
                 .sort_values("end")
             )
             plot["Quarterly Revenue ($B)"] = plot["q"] / 1e9
@@ -405,7 +415,7 @@ with tab1:
         plot = (
             ni_q[["end", "val"]]
             .rename(columns={"val": "q"})
-            .merge(ni_ttm[["end", "ttm"]].rename(columns={"ttm": "ttm"}), on="end", how="left")
+            .merge(ni_ttm[["end", "ttm"]], on="end", how="left")
             .sort_values("end")
         )
         plot["Quarterly Net Income ($B)"] = plot["q"] / 1e9
