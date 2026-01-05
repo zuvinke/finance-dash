@@ -44,11 +44,13 @@ def load_ticker_map():
 
     rows = []
     for _, v in data.items():
-        rows.append({
-            "ticker": str(v.get("ticker", "")).upper(),
-            "cik": int(v.get("cik_str")),
-            "name": v.get("title", "")
-        })
+        rows.append(
+            {
+                "ticker": str(v.get("ticker", "")).upper(),
+                "cik": int(v.get("cik_str")),
+                "name": v.get("title", ""),
+            }
+        )
     df = pd.DataFrame(rows).dropna()
     df = df[df["ticker"] != ""].drop_duplicates("ticker").reset_index(drop=True)
     return df
@@ -101,6 +103,12 @@ def build_quarterly(df: pd.DataFrame):
         return df
     q = df[df["fp"].isin(["Q1", "Q2", "Q3", "Q4"])].copy()
     return keep_latest_per_period(q)
+
+def build_annual(df: pd.DataFrame):
+    if df.empty:
+        return df
+    a = df[df["fp"].isin(["FY"])].copy()
+    return keep_latest_per_period(a)
 
 FP_ORDER = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4, "FY": 5}
 
@@ -183,6 +191,91 @@ def fmt_billions(x):
     return f"{x/1e9:,.2f}B"
 
 # ----------------------------
+# Revenue derivation (Option 1)
+# ----------------------------
+def _fy_quarter_end_dates(fy_end: pd.Timestamp):
+    """Approximate quarter-end dates for a fiscal year ending at fy_end."""
+    q4 = pd.Timestamp(fy_end)
+    q3 = q4 - pd.DateOffset(months=3)
+    q2 = q4 - pd.DateOffset(months=6)
+    q1 = q4 - pd.DateOffset(months=9)
+    return [q1, q2, q3, q4]
+
+def derive_quarterly_from_fy(rev_q_real: pd.DataFrame, rev_fy: pd.DataFrame) -> pd.DataFrame:
+    """
+    Derive quarterly revenue from FY totals using seasonality weights learned from
+    available real quarterly revenue. If insufficient real data, fallback to 25% each.
+    Returns: DataFrame with columns: end, val, derived(True/False)
+    """
+    if rev_fy is None or rev_fy.empty:
+        return pd.DataFrame(columns=["end", "val", "derived"])
+
+    # Learn weights from real quarterly revenue if possible
+    weights = {1: 0.25, 2: 0.25, 3: 0.25, 4: 0.25}
+    if rev_q_real is not None and not rev_q_real.empty:
+        rq = rev_q_real.dropna(subset=["end", "val", "fy", "fp"]).copy()
+        rq = rq[rq["fp"].isin(["Q1", "Q2", "Q3", "Q4"])].copy()
+        if not rq.empty:
+            rq["qnum"] = rq["fp"].map({"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4})
+            # Sum quarters per FY where we have at least 3 quarters (to estimate seasonality)
+            sums = rq.groupby("fy")["val"].sum()
+            valid_fy = sums[sums > 0].index.tolist()
+            rq = rq[rq["fy"].isin(valid_fy)]
+            if not rq.empty:
+                rq = rq.merge(sums.rename("fy_sum"), left_on="fy", right_index=True, how="left")
+                rq["share"] = rq["val"] / rq["fy_sum"]
+                w = rq.groupby("qnum")["share"].mean().to_dict()
+                if len(w) == 4 and abs(sum(w.values()) - 1.0) < 0.25:
+                    weights = w
+                else:
+                    # Normalize whatever we have if partial, else keep equal
+                    if len(w) >= 2:
+                        s = sum(w.values())
+                        if s > 0:
+                            w_norm = {k: v / s for k, v in w.items()}
+                            for k in [1, 2, 3, 4]:
+                                weights[k] = w_norm.get(k, 0.0)
+                            # If some quarters missing, spread remaining equally
+                            missing = [k for k in [1, 2, 3, 4] if weights[k] == 0.0]
+                            rem = 1.0 - sum(weights[k] for k in [1, 2, 3, 4] if weights[k] > 0)
+                            if missing and rem > 0:
+                                for k in missing:
+                                    weights[k] = rem / len(missing)
+
+    out_rows = []
+    for _, r in rev_fy.sort_values("end").iterrows():
+        fy_end = pd.Timestamp(r["end"])
+        fy_val = float(r["val"])
+        fy = r.get("fy", None)
+
+        q_ends = _fy_quarter_end_dates(fy_end)
+        q_vals = [
+            fy_val * float(weights[1]),
+            fy_val * float(weights[2]),
+            fy_val * float(weights[3]),
+            fy_val * float(weights[4]),
+        ]
+
+        for q_end, q_val, fp in zip(q_ends, q_vals, ["Q1", "Q2", "Q3", "Q4"]):
+            out_rows.append(
+                {
+                    "end": pd.Timestamp(q_end),
+                    "val": q_val,
+                    "fy": fy,
+                    "fp": fp,
+                    "derived": True,
+                }
+            )
+
+    ddf = pd.DataFrame(out_rows)
+    if ddf.empty:
+        return ddf
+
+    # Keep unique ends (in case overlaps) and sort
+    ddf = ddf.sort_values("end").drop_duplicates(subset=["end"], keep="last").reset_index(drop=True)
+    return ddf[["end", "val", "derived", "fy", "fp"]]
+
+# ----------------------------
 # Optional: FMP surprises
 # ----------------------------
 @st.cache_data(ttl=24 * 3600)
@@ -210,17 +303,23 @@ def surprises_to_df(raw):
 def bar_plus_line(df, x_col, bar_col, line_col, bar_title, line_title):
     base = alt.Chart(df).encode(
         x=alt.X(f"{x_col}:T", title="Period End"),
-        tooltip=[alt.Tooltip(f"{x_col}:T", title="End"),
-                 alt.Tooltip(f"{bar_col}:Q", title=bar_title),
-                 alt.Tooltip(f"{line_col}:Q", title=line_title)]
+        tooltip=[
+            alt.Tooltip(f"{x_col}:T", title="End"),
+            alt.Tooltip(f"{bar_col}:Q", title=bar_title),
+            alt.Tooltip(f"{line_col}:Q", title=line_title),
+        ],
     )
-    bars = base.mark_bar().encode(
-        y=alt.Y(f"{bar_col}:Q", title=bar_title)
-    )
-    line = base.mark_line(strokeWidth=3).encode(
-        y=alt.Y(f"{line_col}:Q", title=line_title)
-    )
+    bars = base.mark_bar().encode(y=alt.Y(f"{bar_col}:Q", title=bar_title))
+    line = base.mark_line(strokeWidth=3).encode(y=alt.Y(f"{line_col}:Q", title=line_title))
     st.altair_chart(alt.layer(bars, line).resolve_scale(y="independent"), use_container_width=True)
+
+def simple_bars(df, x_col, y_col, y_title):
+    chart = alt.Chart(df).mark_bar().encode(
+        x=alt.X(f"{x_col}:T", title="Period End"),
+        y=alt.Y(f"{y_col}:Q", title=y_title),
+        tooltip=[alt.Tooltip(f"{x_col}:T", title="End"), alt.Tooltip(f"{y_col}:Q", title=y_title)],
+    )
+    st.altair_chart(chart, use_container_width=True)
 
 def grouped_bars_long(df_long, y_title):
     chart = alt.Chart(df_long).mark_bar().encode(
@@ -228,9 +327,11 @@ def grouped_bars_long(df_long, y_title):
         y=alt.Y("value:Q", title=y_title),
         color=alt.Color("series:N", title="Series"),
         xOffset="series:N",
-        tooltip=[alt.Tooltip("end:T", title="End"),
-                 alt.Tooltip("series:N", title="Series"),
-                 alt.Tooltip("value:Q", title=y_title)]
+        tooltip=[
+            alt.Tooltip("end:T", title="End"),
+            alt.Tooltip("series:N", title="Series"),
+            alt.Tooltip("value:Q", title=y_title),
+        ],
     )
     st.altair_chart(chart, use_container_width=True)
 
@@ -288,57 +389,52 @@ def load_metric_df(label, candidates, preferred_units):
     return pd.DataFrame(columns=["end", "fy", "fp", "form", "filed", "val", "metric"])
 
 rev_df = load_metric_df("Revenue", REVENUE_TAG_CANDIDATES, preferred_units=("USD",))
-ni_df  = load_metric_df("Net Income", NET_INCOME_CANDIDATES, preferred_units=("USD",))
+ni_df = load_metric_df("Net Income", NET_INCOME_CANDIDATES, preferred_units=("USD",))
 eps_df = load_metric_df("EPS (Diluted)", EPS_DILUTED_CANDIDATES, preferred_units=("USD/shares",))
-gp_df  = load_metric_df("Gross Profit", GROSS_PROFIT_CANDIDATES, preferred_units=("USD",))
-op_df  = load_metric_df("Operating Income", OPERATING_INCOME_CANDIDATES, preferred_units=("USD",))
+gp_df = load_metric_df("Gross Profit", GROSS_PROFIT_CANDIDATES, preferred_units=("USD",))
+op_df = load_metric_df("Operating Income", OPERATING_INCOME_CANDIDATES, preferred_units=("USD",))
 
 # ----------------------------
-# Quarterly series (Revenue special handling)
+# Build quarterly + annual series
 # ----------------------------
-# Revenue in SEC XBRL can be FY-only for some companies (including AAPL in recent years).
-# Convert YTD -> quarterly, but if we still don't have enough quarters to be meaningful,
-# we hide the revenue chart to avoid misleading visuals.
-rev_q = ytd_to_quarterly(rev_df)
-if rev_q.empty:
-    rev_q = build_quarterly(rev_df)
+rev_q_real = build_quarterly(rev_df)  # may be sparse/unreliable depending on filer
+rev_fy = build_annual(rev_df)
 
-# If still too sparse, treat as unavailable for charting
-if len(rev_q) < 4:
-    rev_q_chart = pd.DataFrame()
-else:
-    rev_q_chart = rev_q
+# Derived quarterly revenue from FY totals (Option 1)
+rev_q_derived = derive_quarterly_from_fy(rev_q_real, rev_fy)
 
 # Other income statement items: YTD->Quarterly is typically best
-ni_q  = ytd_to_quarterly(ni_df)
-gp_q  = ytd_to_quarterly(gp_df)
-op_q  = ytd_to_quarterly(op_df)
+ni_q = ytd_to_quarterly(ni_df)
+gp_q = ytd_to_quarterly(gp_df)
+op_q = ytd_to_quarterly(op_df)
 
 # EPS usually already quarterly
 eps_q = build_quarterly(eps_df)
 
 # Derived metrics
-if not rev_q.empty:
-    rev_q = rev_q.sort_values("end").reset_index(drop=True)
-    rev_q["Revenue YoY %"] = yoy_growth(rev_q["val"], periods=4)
-
 if not eps_q.empty:
     eps_q = eps_q.sort_values("end").reset_index(drop=True)
     eps_q["EPS YoY %"] = yoy_growth(eps_q["val"], periods=4)
 
+# For revenue YoY, use derived quarterly (more complete), but only if enough points
+rev_yoy_df = rev_q_derived.copy() if not rev_q_derived.empty else pd.DataFrame()
+if not rev_yoy_df.empty and len(rev_yoy_df) >= 8:
+    rev_yoy_df = rev_yoy_df.sort_values("end").reset_index(drop=True)
+    rev_yoy_df["Revenue YoY %"] = yoy_growth(rev_yoy_df["val"], periods=4)
+
 # TTM
-rev_ttm = compute_ttm(rev_q, "val") if not rev_q.empty else rev_q
-ni_ttm  = compute_ttm(ni_q, "val") if not ni_q.empty else ni_q
+rev_ttm_derived = compute_ttm(rev_q_derived, "val") if not rev_q_derived.empty else rev_q_derived
+ni_ttm = compute_ttm(ni_q, "val") if not ni_q.empty else ni_q
 
 eps_ttm = None
 if not eps_q.empty:
     eps_ttm = eps_q.sort_values("end").copy()
     eps_ttm["ttm_eps"] = eps_ttm["val"].rolling(4).sum()
 
-# Margins
+# Margins - use derived revenue as denominator (more complete), and derived NI if available
 margins_q = None
-if not rev_q.empty:
-    margins_q = pd.DataFrame({"end": rev_q["end"], "revenue": rev_q["val"]})
+if not rev_q_derived.empty:
+    margins_q = pd.DataFrame({"end": rev_q_derived["end"], "revenue": rev_q_derived["val"]}).sort_values("end")
     if not gp_q.empty:
         margins_q = margins_q.merge(gp_q[["end", "val"]].rename(columns={"val": "gross_profit"}), on="end", how="left")
         margins_q["Gross Margin %"] = (margins_q["gross_profit"] / margins_q["revenue"]) * 100.0
@@ -349,15 +445,15 @@ if not rev_q.empty:
         margins_q = margins_q.merge(ni_q[["end", "val"]].rename(columns={"val": "net_income"}), on="end", how="left")
         margins_q["Net Margin %"] = (margins_q["net_income"] / margins_q["revenue"]) * 100.0
 
-# KPI (independent latest)
-k_rev, d_rev = latest_val(rev_q)
+# KPI (Revenue KPI uses FY latest if available, else derived quarterly latest)
+k_rev_q, d_rev_q = latest_val(rev_q_derived) if not rev_q_derived.empty else (np.nan, "N/A")
 k_eps, d_eps = latest_val(eps_q)
-k_ni,  d_ni  = latest_val(ni_q)
+k_ni, d_ni = latest_val(ni_q)
 
 c1, c2, c3, c4 = st.columns(4)
 with c1:
-    st.metric("Latest Quarterly Revenue", value=fmt_billions(k_rev))
-    st.caption(f"Period end: {d_rev}")
+    st.metric("Latest Quarterly Revenue (Derived)", value=fmt_billions(k_rev_q))
+    st.caption(f"Period end: {d_rev_q}")
 with c2:
     st.metric("Latest Quarterly EPS (Diluted)", value="N/A" if np.isnan(k_eps) else f"{k_eps:.2f}")
     st.caption(f"Period end: {d_eps}")
@@ -373,28 +469,40 @@ with c4:
 tab1, tab2, tab3 = st.tabs(["Earnings Trends", "Margins & Growth", "Earnings Surprises (Optional)"])
 
 with tab1:
+    # Revenue row: Option 2 (Annual) next to Option 1 (Derived quarterly)
     left, right = st.columns(2)
 
     with left:
-        st.subheader("Revenue (Quarterly) + TTM")
-        if rev_q_chart.empty:
-            st.info(
-                "Quarterly revenue is not consistently available in SEC XBRL for this company.\n\n"
-                "This can happen (including AAPL). EPS and Net Income remain reliable."
-            )
+        st.subheader("Revenue (Annual, SEC) — Option 2")
+        if rev_fy.empty:
+            st.info("Annual revenue not found in SEC tags for this ticker.")
+        else:
+            fy_plot = rev_fy[["end", "val"]].sort_values("end").copy()
+            fy_plot["Revenue ($B)"] = fy_plot["val"] / 1e9
+            simple_bars(fy_plot, "end", "Revenue ($B)", "Annual Revenue ($B)")
+            st.caption("This is SEC-reported FY revenue (official).")
+
+    with right:
+        st.subheader("Revenue (Derived Quarterly) + TTM — Option 1")
+        if rev_q_derived.empty:
+            st.info("Could not derive quarterly revenue (FY data missing).")
         else:
             plot = (
-                rev_q_chart[["end", "val"]]
+                rev_q_derived[["end", "val"]]
                 .rename(columns={"val": "q"})
-                .merge(compute_ttm(rev_q_chart, "val")[["end", "ttm"]], on="end", how="left")
+                .merge(rev_ttm_derived[["end", "ttm"]], on="end", how="left")
                 .sort_values("end")
             )
             plot["Quarterly Revenue ($B)"] = plot["q"] / 1e9
             plot["TTM Revenue ($B)"] = plot["ttm"] / 1e9
             bar_plus_line(plot, "end", "Quarterly Revenue ($B)", "TTM Revenue ($B)",
-                          "Quarterly Revenue ($B)", "TTM Revenue ($B)")
+                          "Derived Quarterly Revenue ($B)", "TTM Revenue ($B)")
+            st.caption("Derived from FY totals using learned seasonality (estimate).")
 
-    with right:
+    # EPS + NI row
+    left2, right2 = st.columns(2)
+
+    with left2:
         st.subheader("EPS (Diluted) (Quarterly) + TTM (approx)")
         if eps_q.empty:
             st.info("EPS diluted not found for this ticker in SEC tags (rare).")
@@ -408,20 +516,21 @@ with tab1:
             plot["TTM EPS"] = plot["ttm"]
             bar_plus_line(plot, "end", "Quarterly EPS", "TTM EPS", "Quarterly EPS", "TTM EPS")
 
-    st.subheader("Net Income (Quarterly) + TTM")
-    if ni_q.empty:
-        st.info("Net income not found for this ticker in SEC tags (rare).")
-    else:
-        plot = (
-            ni_q[["end", "val"]]
-            .rename(columns={"val": "q"})
-            .merge(ni_ttm[["end", "ttm"]], on="end", how="left")
-            .sort_values("end")
-        )
-        plot["Quarterly Net Income ($B)"] = plot["q"] / 1e9
-        plot["TTM Net Income ($B)"] = plot["ttm"] / 1e9
-        bar_plus_line(plot, "end", "Quarterly Net Income ($B)", "TTM Net Income ($B)",
-                      "Quarterly Net Income ($B)", "TTM Net Income ($B)")
+    with right2:
+        st.subheader("Net Income (Quarterly) + TTM")
+        if ni_q.empty:
+            st.info("Net income not found for this ticker in SEC tags (rare).")
+        else:
+            plot = (
+                ni_q[["end", "val"]]
+                .rename(columns={"val": "q"})
+                .merge(ni_ttm[["end", "ttm"]], on="end", how="left")
+                .sort_values("end")
+            )
+            plot["Quarterly Net Income ($B)"] = plot["q"] / 1e9
+            plot["TTM Net Income ($B)"] = plot["ttm"] / 1e9
+            bar_plus_line(plot, "end", "Quarterly Net Income ($B)", "TTM Net Income ($B)",
+                          "Quarterly Net Income ($B)", "TTM Net Income ($B)")
 
 with tab2:
     left, right = st.columns(2)
@@ -429,12 +538,20 @@ with tab2:
     with left:
         st.subheader("YoY Growth (Quarterly)")
         rows = []
-        if not rev_q.empty and "Revenue YoY %" in rev_q.columns:
-            rows.append(rev_q[["end", "Revenue YoY %"]].rename(columns={"Revenue YoY %": "value"}).assign(series="Revenue YoY %"))
+        if not rev_yoy_df.empty and "Revenue YoY %" in rev_yoy_df.columns:
+            rows.append(
+                rev_yoy_df[["end", "Revenue YoY %"]]
+                .rename(columns={"Revenue YoY %": "value"})
+                .assign(series="Revenue YoY % (Derived)")
+            )
         if not eps_q.empty and "EPS YoY %" in eps_q.columns:
-            rows.append(eps_q[["end", "EPS YoY %"]].rename(columns={"EPS YoY %": "value"}).assign(series="EPS YoY %"))
+            rows.append(
+                eps_q[["end", "EPS YoY %"]]
+                .rename(columns={"EPS YoY %": "value"})
+                .assign(series="EPS YoY %")
+            )
         if not rows:
-            st.info("No revenue/EPS data to compute YoY.")
+            st.info("Not enough data to compute YoY yet.")
         else:
             yoy_long = pd.concat(rows, ignore_index=True).dropna(subset=["end", "value"]).sort_values("end")
             grouped_bars_long(yoy_long, "YoY Growth (%)")
@@ -454,8 +571,8 @@ with tab2:
 
     st.subheader("Raw SEC Data (last 12 quarters)")
     ends = []
-    if not rev_q.empty:
-        ends.append(rev_q["end"])
+    if not rev_q_derived.empty:
+        ends.append(rev_q_derived["end"])
     if not eps_q.empty:
         ends.append(eps_q["end"])
     if not ni_q.empty:
@@ -466,8 +583,8 @@ with tab2:
     else:
         show_df = pd.DataFrame({"end": pd.concat(ends).dropna().drop_duplicates().sort_values()})
 
-        if not rev_q.empty:
-            show_df = show_df.merge(rev_q[["end", "val"]].rename(columns={"val": "revenue"}), on="end", how="left")
+        if not rev_q_derived.empty:
+            show_df = show_df.merge(rev_q_derived[["end", "val"]].rename(columns={"val": "revenue_derived"}), on="end", how="left")
         if not eps_q.empty:
             show_df = show_df.merge(eps_q[["end", "val"]].rename(columns={"val": "eps_diluted"}), on="end", how="left")
         if not ni_q.empty:
@@ -490,15 +607,18 @@ with tab3:
         if s_df.empty:
             st.info("No surprise data returned (could be coverage or rate limit).")
         else:
-            plot = s_df[["date", "surprisePercent"]].dropna().sort_values("date").rename(
-                columns={"date": "end", "surprisePercent": "value"}
+            plot = (
+                s_df[["date", "surprisePercent"]]
+                .dropna()
+                .sort_values("date")
+                .rename(columns={"date": "end", "surprisePercent": "value"})
             )
             plot["series"] = "Surprise %"
             grouped_bars_long(plot, "Surprise (%)")
 
             st.dataframe(
                 s_df[["date", "epsEstimated", "epsActual", "surprise", "surprisePercent"]].head(20),
-                use_container_width=True
+                use_container_width=True,
             )
 
 # ----------------------------
